@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use clap::Parser;
 use http::Uri;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::client::conn::http1::Builder;
@@ -12,9 +13,18 @@ use tokio::net::{TcpListener, TcpStream};
 pub mod support;
 use crate::support::TokioIo;
 
+#[derive(Debug, Parser)]
+#[clap(about, version, long_about = None)]
+pub struct Opts {
+    /// Which port to listen on
+    #[clap(short, long, default_value_t = 7777)]
+    port: u16,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 7777));
+    let opts = Opts::parse();
+    let addr = SocketAddr::from(([127, 0, 0, 1], opts.port));
 
     let listener = TcpListener::bind(addr).await?;
     println!("Listening on http://{}", addr);
@@ -56,7 +66,6 @@ async fn proxy(
 
         *req.uri_mut() = urib;
     }
-    dbg!("req: {:?}", &req);
 
     if Method::CONNECT == req.method() {
         // Received an HTTP request like:
@@ -136,6 +145,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 // the upgraded connection
 async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     // Connect to remote server
+    dbg!(&upgraded);
     let mut server = TcpStream::connect(addr).await?;
     let mut upgraded = TokioIo::new(upgraded);
 
