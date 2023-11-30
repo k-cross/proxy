@@ -1,10 +1,17 @@
+use bytes::Bytes;
 use clap::Parser;
-use hyper::{Body, Client, Request, Response, Server, StatusCode, Method, Uri};
+use http::Uri;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use hyper::client::conn::http1::Builder;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
+use hyper::{Method, Request, Response};
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tower::make::Shared;
+use tokio::net::{TcpListener, TcpStream};
+
+pub mod support;
+use crate::support::TokioIo;
 
 #[derive(Debug, Parser)]
 #[clap(about, version, long_about = None)]
@@ -15,23 +22,34 @@ pub struct Opts {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = Opts::parse();
-    let make_service = Shared::new(service_fn(log));
-
     let addr = SocketAddr::from(([127, 0, 0, 1], opts.port));
-    let server = Server::bind(&addr).serve(make_service);
-    println!("Listening at: http://{}", &addr);
 
-    if let Err(e) = server.await {
-        println!("error: {}", e);
+    let listener = TcpListener::bind(addr).await?;
+    println!("Listening on http://{}", addr);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(io, service_fn(proxy))
+                .with_upgrades()
+                .await
+            {
+                println!("Failed to serve connection: {:?}", err);
+            }
+        });
     }
 }
 
-async fn log(mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    dbg!(&req);
-    dbg!(&req.uri());
-    dbg!(&req.uri().authority());
+async fn proxy(
+    mut req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     if req.uri().host().unwrap() == "api.formswift.com" {
         let p = req.uri().path();
         let q = match req.uri().query() {
@@ -48,9 +66,8 @@ async fn log(mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
 
         *req.uri_mut() = urib;
     }
-    dbg!(&req.uri());
 
-    if req.method() == Method::CONNECT {
+    if Method::CONNECT == req.method() {
         // Received an HTTP request like:
         // ```
         // CONNECT www.domain.com:443 HTTP/1.1
@@ -58,11 +75,12 @@ async fn log(mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
         // Proxy-Connection: Keep-Alive
         // ```
         //
-        // When HTTP method is CONNECT return an empty body then upgrade the connection and talk a
-        // new protocol.
+        // When HTTP method is CONNECT we should return an empty body
+        // then we can eventually upgrade the connection and talk a new protocol.
         //
-        // Note: only after client received an empty body with STATUS_OK can the connection be
-        // upgraded, so we can't return a response inside `on_upgrade` future.
+        // Note: only after client received an empty body with STATUS_OK can the
+        // connection be upgraded, so we can't return a response inside
+        // `on_upgrade` future.
         if let Some(addr) = host_addr(req.uri()) {
             tokio::task::spawn(async move {
                 match hyper::upgrade::on(req).await {
@@ -75,36 +93,61 @@ async fn log(mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
                 }
             });
 
-            Ok(Response::new(Body::empty()))
+            Ok(Response::new(empty()))
         } else {
             eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
-            let mut resp = Response::new(Body::from("CONNECT must be to a socket address"));
-            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            let mut resp = Response::new(full("CONNECT must be to a socket address"));
+            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
 
             Ok(resp)
         }
     } else {
-        let path = req.uri().path();
+        let host = req.uri().host().expect("uri has no host");
+        let port = req.uri().port_u16().unwrap_or(80);
+        let addr = format!("{}:{}", host, port);
 
-        if path.starts_with("/api") {
-            println!("API Path: {}", path);
-        } else {
-            println!("Generic Path: {}", path);
-        }
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
 
-        handle(req).await
+        let (mut sender, conn) = Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(io)
+            .await?;
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                println!("Connection failed: {:?}", err);
+            }
+        });
+
+        let resp = sender.send_request(req).await?;
+        Ok(resp.map(|b| b.boxed()))
     }
 }
 
-fn host_addr(uri: &Uri) -> Option<String> {
+fn host_addr(uri: &http::Uri) -> Option<String> {
     uri.authority().and_then(|auth| Some(auth.to_string()))
 }
 
-// Create a TCP connection to host:port, build a tunnel between the connection and the upgraded
-// connection
-async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
+fn empty() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+// Create a TCP connection to host:port, build a tunnel between the connection and
+// the upgraded connection
+async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     // Connect to remote server
+    dbg!(&upgraded);
     let mut server = TcpStream::connect(addr).await?;
+    let mut upgraded = TokioIo::new(upgraded);
 
     // Proxying data
     let (from_client, from_server) =
@@ -117,9 +160,4 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     );
 
     Ok(())
-}
-
-async fn handle(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    let client = Client::new();
-    client.request(req).await
 }
