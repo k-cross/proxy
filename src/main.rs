@@ -17,8 +17,12 @@ use crate::support::TokioIo;
 #[clap(about, version, long_about = None)]
 pub struct Opts {
     /// Which port to listen on
-    #[clap(short, long, default_value_t = 7777)]
+    #[arg(short, long, default_value_t = 7777)]
     port: u16,
+
+    /// Domain listener to make modifications on
+    #[arg(short, long, default_value = "google.com")]
+    domain: String,
 }
 
 #[tokio::main]
@@ -126,7 +130,7 @@ async fn proxy(
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
-    uri.authority().and_then(|auth| Some(auth.to_string()))
+    uri.authority().map(|auth| auth.to_string())
 }
 
 fn empty() -> BoxBody<Bytes, hyper::Error> {

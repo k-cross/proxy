@@ -1,5 +1,5 @@
 [package]
-name = "qwer"
+name = "rxtx"
 version = "0.1.0"
 edition = "2021"
 authors = ["KMC <ken.q.cross@gmail.com"]
